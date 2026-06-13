@@ -10,7 +10,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// ─── Base address ───────────────────────────────────────────────────────────
+// ─── Base address ────────────────────────────────────────────────────────────
 static uintptr_t g_base = 0;
 
 static uintptr_t GetBase() {
@@ -31,127 +31,112 @@ static uintptr_t GetBase() {
 
 #define OFF(x) (g_base + (x))
 
-// ─── RenderWare function typedefs ────────────────────────────────────────────
-
-// RpSkinGetOpenGLPipeline(RpSkinType) → RxPipeline*
+// ─── Typedefs ────────────────────────────────────────────────────────────────
 typedef RxPipeline* (*RpSkinGetOpenGLPipeline_t)(RpSkinType);
+typedef RxPipelineNode* (*RxPipelineFindNodeByName_t)(RxPipeline*, const char*, RxPipelineNode*, int*);
+typedef void (*RxOpenGLAllInOneSetRenderCallBack_t)(RxPipelineNode*, RxOpenGLAllInOneRenderCB);
+typedef RxOpenGLAllInOneRenderCB (*RxOpenGLAllInOneGetRenderCallBack_t)(RxPipelineNode*);
+typedef int  (*RwRenderStateSet_t)(RwRenderState, void*);
+typedef int  (*RwRenderStateGet_t)(RwRenderState, void*);
+typedef void* (*eglSwapBuffers_t)(void*, void*);
 
-// RxPipelineFindNodeByName(RxPipeline*, const char*, RxPipelineNode*, int*) → RxPipelineNode*
-typedef RxPipelineNode* (*RxPipelineFindNodeByName_t)(
-    RxPipeline*, const char*, RxPipelineNode*, int*);
-
-// RxOpenGLAllInOneSetRenderCallBack(RxPipelineNode*, callback) → void
-typedef void (*RxOpenGLAllInOneSetRenderCallBack_t)(
-    RxPipelineNode*, RxOpenGLAllInOneRenderCB);
-
-// RxOpenGLAllInOneGetRenderCallBack(RxPipelineNode*) → callback
-typedef RxOpenGLAllInOneRenderCB (*RxOpenGLAllInOneGetRenderCallBack_t)(
-    RxPipelineNode*);
-
-// RwRenderStateSet / Get
-typedef int (*RwRenderStateSet_t)(RwRenderState, void*);
-typedef int (*RwRenderStateGet_t)(RwRenderState, void*);
-
-// ─── Offsets (confirmed from nm -D libGTASA.so) ──────────────────────────────
-// 001c8758 T RpSkinGetOpenGLPipeline
-// 001df9a8 T RxPipelineFindNodeByName
-// 0022302c T RxOpenGLAllInOneSetRenderCallBack
-// 00223032 T RxOpenGLAllInOneGetRenderCallBack
-// 001e2914 T RwRenderStateSet
-// 001e2948 T RwRenderStateGet
-
-#define OFF_RpSkinGetOpenGLPipeline          0x1c8758
-#define OFF_RxPipelineFindNodeByName         0x1df9a8
+// ─── Offsets ─────────────────────────────────────────────────────────────────
+#define OFF_RpSkinGetOpenGLPipeline           0x1c8758
+#define OFF_RxPipelineFindNodeByName          0x1df9a8
 #define OFF_RxOpenGLAllInOneSetRenderCallBack 0x22302c
 #define OFF_RxOpenGLAllInOneGetRenderCallBack 0x223032
-#define OFF_RwRenderStateSet                 0x1e2914
-#define OFF_RwRenderStateGet                 0x1e2948
+#define OFF_RwRenderStateSet                  0x1e2914
+#define OFF_RwRenderStateGet                  0x1e2948
+#define OFF_eglSwapBuffers                    0x268f4c
 
 // ─── Globals ─────────────────────────────────────────────────────────────────
-static RxOpenGLAllInOneRenderCB g_origRenderCB  = nullptr;
-static RwRenderStateSet_t       g_RwRSSet        = nullptr;
-static RwRenderStateGet_t       g_RwRSGet        = nullptr;
+static RxOpenGLAllInOneRenderCB g_origRenderCB = nullptr;
+static RwRenderStateSet_t       g_RwRSSet       = nullptr;
+static eglSwapBuffers_t         g_origSwap      = nullptr;
+static bool                     g_chamsInstalled = false;
 
-// Chams color: solid red, no texture, visible through walls
-// Bisa diganti sesuka hati
-static bool g_chamsEnabled = true;
+// ─── Dobby ───────────────────────────────────────────────────────────────────
+typedef int (*DobbyHook_t)(void* addr, void* replace, void** orig);
+static DobbyHook_t DobbyHook = nullptr;
 
-// ─── Custom render callback ───────────────────────────────────────────────────
-static void ChamsRenderCB(
-    RwResEntry*  repEntry,
-    void*        object,
-    unsigned char type,
-    unsigned int  flags)
-{
-    if (!g_chamsEnabled || !g_origRenderCB) {
-        if (g_origRenderCB) g_origRenderCB(repEntry, object, type, flags);
-        return;
-    }
-
-    // ── Pass 1: Through-wall (no depth test, solid color) ──
-    g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)0);   // disable depth test
-    g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)0);   // disable depth write
-    g_RwRSSet(rwRENDERSTATETEXTURERASTER, (void*)0);   // no texture → flat color
-    g_RwRSSet(rwRENDERSTATESRCBLEND,      (void*)rwBLENDONE);
-    g_RwRSSet(rwRENDERSTATEDESTBLEND,     (void*)rwBLENDZERO);
-
-    // Render through wall (merah)
-    g_origRenderCB(repEntry, object, type, flags);
-
-    // ── Pass 2: Normal render on top ──
-    g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)1);
-    g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)1);
-    g_RwRSSet(rwRENDERSTATETEXTURERASTER, (void*)0);   // tetap no texture
-    g_RwRSSet(rwRENDERSTATESRCBLEND,      (void*)rwBLENDSRCALPHA);
-    g_RwRSSet(rwRENDERSTATEDESTBLEND,     (void*)rwBLENDINVSRCALPHA);
-
-    g_origRenderCB(repEntry, object, type, flags);
-
-    // ── Restore default state ──
-    g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)1);
-    g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)1);
-    g_RwRSSet(rwRENDERSTATESRCBLEND,      (void*)rwBLENDSRCALPHA);
-    g_RwRSSet(rwRENDERSTATEDESTBLEND,     (void*)rwBLENDINVSRCALPHA);
+static bool LoadDobby() {
+    void* h = dlopen("libdobby.so", RTLD_NOW);
+    if (!h) { LOGE("dlopen libdobby.so failed: %s", dlerror()); return false; }
+    DobbyHook = (DobbyHook_t)dlsym(h, "DobbyHook");
+    if (!DobbyHook) { LOGE("dlsym DobbyHook failed"); return false; }
+    LOGI("Dobby loaded");
+    return true;
 }
 
-// ─── Install hook ─────────────────────────────────────────────────────────────
+// ─── Chams render callback ────────────────────────────────────────────────────
+static void ChamsRenderCB(RwResEntry* repEntry, void* object, unsigned char type, unsigned int flags) {
+    if (!g_origRenderCB) return;
+
+    // Pass 1: through wall, no texture
+    g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)0);
+    g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)0);
+    g_RwRSSet(rwRENDERSTATETEXTURERASTER, (void*)0);
+    g_origRenderCB(repEntry, object, type, flags);
+
+    // Pass 2: normal on top
+    g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)1);
+    g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)1);
+    g_origRenderCB(repEntry, object, type, flags);
+
+    // Restore
+    g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)1);
+    g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)1);
+    g_RwRSSet(rwRENDERSTATETEXTURERASTER, (void*)0);
+}
+
+// ─── Install chams (dipanggil dari eglSwapBuffers hook) ───────────────────────
 static bool InstallChams() {
     uintptr_t base = GetBase();
-    if (!base) { LOGE("Failed to get base"); return false; }
+    if (!base) { LOGE("No base"); return false; }
 
     auto fnSkinGetPipe = (RpSkinGetOpenGLPipeline_t)          OFF(OFF_RpSkinGetOpenGLPipeline);
     auto fnFindNode    = (RxPipelineFindNodeByName_t)          OFF(OFF_RxPipelineFindNodeByName);
     auto fnSetCB       = (RxOpenGLAllInOneSetRenderCallBack_t) OFF(OFF_RxOpenGLAllInOneSetRenderCallBack);
     auto fnGetCB       = (RxOpenGLAllInOneGetRenderCallBack_t) OFF(OFF_RxOpenGLAllInOneGetRenderCallBack);
+    g_RwRSSet          = (RwRenderStateSet_t)                  OFF(OFF_RwRenderStateSet);
 
-    g_RwRSSet = (RwRenderStateSet_t) OFF(OFF_RwRenderStateSet);
-    g_RwRSGet = (RwRenderStateGet_t) OFF(OFF_RwRenderStateGet);
-
-    // Ambil skin pipeline (MATFX = ped pakai MatFX pipeline)
+    // Coba MATFX dulu, fallback GENERIC
     RxPipeline* pipe = fnSkinGetPipe(rpSKINTYPEMATFX);
-    if (!pipe) {
-        // Fallback ke generic
-        pipe = fnSkinGetPipe(rpSKINTYPEGENERIC);
-    }
-    if (!pipe) { LOGE("Failed to get skin pipeline"); return false; }
-    LOGI("Skin pipeline: %p", pipe);
+    if (!pipe) pipe  = fnSkinGetPipe(rpSKINTYPEGENERIC);
+    if (!pipe) { LOGE("No skin pipeline"); return false; }
+    LOGI("Pipe: %p", pipe);
 
-    // Cari node render
-    int nodeIdx = 0;
-    RxPipelineNode* node = fnFindNode(pipe, "OpenGLAtomicAllInOne", nullptr, &nodeIdx);
-    if (!node) { LOGE("Failed to find pipeline node"); return false; }
-    LOGI("Pipeline node: %p (idx %d)", node, nodeIdx);
+    int idx = 0;
+    RxPipelineNode* node = fnFindNode(pipe, "OpenGLAtomicAllInOne", nullptr, &idx);
+    if (!node) { LOGE("Node not found"); return false; }
+    LOGI("Node: %p", node);
 
-    // Simpan original callback
     g_origRenderCB = fnGetCB(node);
-    if (!g_origRenderCB) { LOGE("Failed to get original render CB"); return false; }
-    LOGI("Original CB: %p", g_origRenderCB);
+    if (!g_origRenderCB) { LOGE("No orig CB"); return false; }
+    LOGI("OrigCB: %p", g_origRenderCB);
 
-    // Set callback kita
     fnSetCB(node, ChamsRenderCB);
-    LOGI("Chams render CB installed!");
-
+    LOGI("Chams installed!");
     return true;
+}
+
+// ─── eglSwapBuffers hook ──────────────────────────────────────────────────────
+// Dipanggil setiap frame — tunggu sampai game fully loaded baru install chams
+static int g_swapCount = 0;
+
+static void* eglSwapBuffers_hook(void* display, void* surface) {
+    if (!g_chamsInstalled) {
+        g_swapCount++;
+        // Tunggu 120 frame (~2 detik) biar RenderWare fully init
+        if (g_swapCount >= 120) {
+            g_chamsInstalled = InstallChams();
+            if (!g_chamsInstalled) {
+                LOGE("InstallChams failed at frame %d, retrying next frame...", g_swapCount);
+                g_swapCount = 119; // retry tiap frame
+            }
+        }
+    }
+    return g_origSwap(display, surface);
 }
 
 // ─── AML exports ─────────────────────────────────────────────────────────────
@@ -164,7 +149,7 @@ struct ModInfo {
 extern "C" __attribute__((visibility("default")))
 void __GetModInfo(ModInfo* info) {
     info->name       = "libchams";
-    info->version    = "2.0";
+    info->version    = "2.1";
     info->handlerVer = 1;
 }
 
@@ -175,10 +160,19 @@ void OnModPreLoad() {
 
 extern "C" __attribute__((visibility("default")))
 void OnModLoad() {
-    LOGI("OnModLoad - installing chams...");
-    if (InstallChams()) {
-        LOGI("Chams v2.0 loaded successfully");
-    } else {
-        LOGE("Chams install failed");
+    LOGI("OnModLoad");
+
+    if (!LoadDobby()) return;
+
+    uintptr_t base = GetBase();
+    if (!base) { LOGE("No base in OnModLoad"); return; }
+
+    // Hook eglSwapBuffers untuk delay install
+    void* addrSwap = (void*)OFF(OFF_eglSwapBuffers);
+    int ret = DobbyHook(addrSwap, (void*)eglSwapBuffers_hook, (void**)&g_origSwap);
+    if (ret != 0) {
+        LOGE("DobbyHook eglSwapBuffers failed: %d", ret);
+        return;
     }
+    LOGI("eglSwapBuffers hooked, waiting for game init...");
 }
