@@ -34,7 +34,6 @@ static uintptr_t GetBase() {
 }
 #define OFF(x) (g_base + (x))
 
-// ─── Typedefs ─────────────────────────────────────────────────────────────────
 typedef RxPipeline*              (*RpSkinGetOpenGLPipeline_t)(RpSkinType);
 typedef RxPipelineNode*          (*RxPipelineFindNodeByName_t)(RxPipeline*, const char*, RxPipelineNode*, int*);
 typedef void                     (*RxOpenGLAllInOneSetRenderCallBack_t)(RxPipelineNode*, RxOpenGLAllInOneRenderCB);
@@ -42,73 +41,54 @@ typedef RxOpenGLAllInOneRenderCB (*RxOpenGLAllInOneGetRenderCallBack_t)(RxPipeli
 typedef int                      (*RwRenderStateSet_t)(RwRenderState, void*);
 typedef int                      (*DobbyHook_t)(void*, void*, void**);
 
-// ─── Offsets ──────────────────────────────────────────────────────────────────
 #define OFF_RpSkinGetOpenGLPipeline           0x1c8758
 #define OFF_RxPipelineFindNodeByName          0x1df9a8
 #define OFF_RxOpenGLAllInOneSetRenderCallBack 0x22302c
 #define OFF_RxOpenGLAllInOneGetRenderCallBack 0x223032
 #define OFF_RwRenderStateSet                  0x1e2914
 
-// ─── Globals ──────────────────────────────────────────────────────────────────
-static RpSkinGetOpenGLPipeline_t        g_origSkinGetPipe = nullptr;
-static RxOpenGLAllInOneRenderCB         g_origRenderCB    = nullptr;
-static RwRenderStateSet_t               g_RwRSSet         = nullptr;
-static bool                             g_chamsInstalled  = false;
+static RxOpenGLAllInOneRenderCB g_origRenderCB = nullptr;
+static RwRenderStateSet_t       g_RwRSSet       = nullptr;
 
-// ─── Chams render callback ────────────────────────────────────────────────────
 static void ChamsRenderCB(RwResEntry* repEntry, void* object,
                           unsigned char type, unsigned int flags) {
     if (!g_origRenderCB) return;
-
-    // Pass 1: through wall, no texture
+    // Pass 1: through wall
     g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)0);
     g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)0);
     g_RwRSSet(rwRENDERSTATETEXTURERASTER, (void*)0);
     g_origRenderCB(repEntry, object, type, flags);
-
-    // Pass 2: normal on top
+    // Pass 2: normal
     g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)1);
     g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)1);
     g_origRenderCB(repEntry, object, type, flags);
-
     // Restore
     g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)1);
     g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)1);
     g_RwRSSet(rwRENDERSTATETEXTURERASTER, (void*)0);
 }
 
-// ─── Hook: RpSkinGetOpenGLPipeline ───────────────────────────────────────────
-// Dipanggil game saat init pipeline — kita intercept dan install chams
-static RxPipeline* hook_RpSkinGetOpenGLPipeline(RpSkinType type) {
-    RxPipeline* pipe = g_origSkinGetPipe(type);
+static void TryInstallOnPipe(RxPipeline* pipe, const char* label) {
+    if (!pipe) { LOGF("[chams] TryInstall: null pipe (%s)", label); return; }
+    LOGF("[chams] TryInstall pipe=%p (%s)", pipe, label);
 
-    LOGF("[chams] hook_RpSkinGetOpenGLPipeline type=%d pipe=%p", (int)type, pipe);
+    auto fnFindNode = (RxPipelineFindNodeByName_t)          OFF(OFF_RxPipelineFindNodeByName);
+    auto fnSetCB    = (RxOpenGLAllInOneSetRenderCallBack_t) OFF(OFF_RxOpenGLAllInOneSetRenderCallBack);
+    auto fnGetCB    = (RxOpenGLAllInOneGetRenderCallBack_t) OFF(OFF_RxOpenGLAllInOneGetRenderCallBack);
 
-    if (!g_chamsInstalled && pipe) {
-        auto fnFindNode = (RxPipelineFindNodeByName_t) OFF(OFF_RxPipelineFindNodeByName);
-        auto fnSetCB    = (RxOpenGLAllInOneSetRenderCallBack_t) OFF(OFF_RxOpenGLAllInOneSetRenderCallBack);
-        auto fnGetCB    = (RxOpenGLAllInOneGetRenderCallBack_t) OFF(OFF_RxOpenGLAllInOneGetRenderCallBack);
+    int idx = 0;
+    RxPipelineNode* node = fnFindNode(pipe, "OpenGLAtomicAllInOne", nullptr, &idx);
+    LOGF("[chams] node=%p idx=%d", node, idx);
+    if (!node) { LOGF("[chams] node not found (%s)", label); return; }
 
-        int idx = 0;
-        RxPipelineNode* node = fnFindNode(pipe, "OpenGLAtomicAllInOne", nullptr, &idx);
-        LOGF("[chams] node=%p idx=%d", node, idx);
+    g_origRenderCB = fnGetCB(node);
+    LOGF("[chams] origCB=%p", g_origRenderCB);
+    if (!g_origRenderCB) { LOGF("[chams] no origCB (%s)", label); return; }
 
-        if (node) {
-            g_origRenderCB = fnGetCB(node);
-            LOGF("[chams] origCB=%p", g_origRenderCB);
-
-            if (g_origRenderCB) {
-                fnSetCB(node, ChamsRenderCB);
-                g_chamsInstalled = true;
-                LOGF("[chams] SUCCESS installed on type=%d!", (int)type);
-            }
-        }
-    }
-
-    return pipe;
+    fnSetCB(node, ChamsRenderCB);
+    LOGF("[chams] SUCCESS on %s!", label);
 }
 
-// ─── AML exports ──────────────────────────────────────────────────────────────
 extern "C" {
 
 EXPORT void* __GetModInfo() {
@@ -130,24 +110,23 @@ EXPORT void OnModLoad() {
 
     g_RwRSSet = (RwRenderStateSet_t) OFF(OFF_RwRenderStateSet);
 
-    // Load Dobby
-    void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hDobby) { LOGF("[chams] ERROR: libdobby: %s", dlerror()); return; }
-    LOGF("[chams] Dobby loaded");
+    // Panggil langsung — pipeline sudah init sebelum mod load
+    auto fnSkinGetPipe = (RpSkinGetOpenGLPipeline_t) OFF(OFF_RpSkinGetOpenGLPipeline);
 
-    auto DobbyHook = (DobbyHook_t)dlsym(hDobby, "DobbyHook");
-    if (!DobbyHook) { LOGF("[chams] ERROR: DobbyHook sym"); return; }
-    LOGF("[chams] DobbyHook: %p", DobbyHook);
+    // Coba semua type
+    for (int t = 0; t <= 3; t++) {
+        LOGF("[chams] trying type=%d", t);
+        RxPipeline* pipe = fnSkinGetPipe((RpSkinType)t);
+        LOGF("[chams] type=%d pipe=%p", t, pipe);
+        if (pipe) {
+            TryInstallOnPipe(pipe, t == 0 ? "NASKIN" :
+                                   t == 1 ? "GENERIC" :
+                                   t == 2 ? "MATFX" : "TOON");
+            if (g_origRenderCB) break;
+        }
+    }
 
-    // Hook RpSkinGetOpenGLPipeline — tunggu game panggil sendiri
-    void* addr = (void*)OFF(OFF_RpSkinGetOpenGLPipeline);
-    LOGF("[chams] Hooking RpSkinGetOpenGLPipeline @ %p", addr);
-
-    int ret = DobbyHook(addr, (void*)hook_RpSkinGetOpenGLPipeline, (void**)&g_origSkinGetPipe);
-    LOGF("[chams] DobbyHook ret=%d origPipe=%p", ret, g_origSkinGetPipe);
-
-    if (ret != 0) { LOGF("[chams] ERROR: DobbyHook failed"); return; }
-    LOGF("[chams] OnModLoad done - waiting for pipeline init...");
+    LOGF("[chams] OnModLoad done origCB=%p", g_origRenderCB);
 }
 
 }
