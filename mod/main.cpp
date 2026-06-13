@@ -2,13 +2,123 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 #include <android/log.h>
+#include "rw_types.h"
 
-#define TAG "libchams"
+#define TAG     "libchams"
+#define LOGFILE "/storage/emulated/0/chams_log.txt"
+
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+
+static void logf_impl(const char* msg) {
+    FILE* f = fopen(LOGFILE, "a");
+    if (f) { fprintf(f, "%s\n", msg); fclose(f); }
+    LOGI("%s", msg);
+}
+#define LOGF(fmt,...) do{ char _b[512]; snprintf(_b,sizeof(_b),fmt,##__VA_ARGS__); logf_impl(_b); }while(0)
 
 #define EXPORT __attribute__((visibility("default")))
 
+// ─── Base address ─────────────────────────────────────────────────────────────
+static uintptr_t g_base = 0;
+
+static uintptr_t GetBase() {
+    if (g_base) return g_base;
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "libGTASA.so") && strstr(line, "r-xp")) {
+            g_base = (uintptr_t)strtoul(line, nullptr, 16);
+            break;
+        }
+    }
+    fclose(f);
+    LOGF("[chams] Base: 0x%08X", (uint32_t)g_base);
+    return g_base;
+}
+
+#define OFF(x) (g_base + (x))
+
+// ─── Typedefs ─────────────────────────────────────────────────────────────────
+typedef RxPipeline*              (*RpSkinGetOpenGLPipeline_t)(RpSkinType);
+typedef RxPipelineNode*          (*RxPipelineFindNodeByName_t)(RxPipeline*, const char*, RxPipelineNode*, int*);
+typedef void                     (*RxOpenGLAllInOneSetRenderCallBack_t)(RxPipelineNode*, RxOpenGLAllInOneRenderCB);
+typedef RxOpenGLAllInOneRenderCB (*RxOpenGLAllInOneGetRenderCallBack_t)(RxPipelineNode*);
+typedef int                      (*RwRenderStateSet_t)(RwRenderState, void*);
+
+// ─── Offsets ──────────────────────────────────────────────────────────────────
+#define OFF_RpSkinGetOpenGLPipeline           0x1c8758
+#define OFF_RxPipelineFindNodeByName          0x1df9a8
+#define OFF_RxOpenGLAllInOneSetRenderCallBack 0x22302c
+#define OFF_RxOpenGLAllInOneGetRenderCallBack 0x223032
+#define OFF_RwRenderStateSet                  0x1e2914
+
+// ─── Globals ──────────────────────────────────────────────────────────────────
+static RxOpenGLAllInOneRenderCB g_origRenderCB  = nullptr;
+static RwRenderStateSet_t       g_RwRSSet        = nullptr;
+static bool                     g_chamsInstalled = false;
+
+// ─── Chams render callback ────────────────────────────────────────────────────
+static void ChamsRenderCB(RwResEntry* repEntry, void* object,
+                          unsigned char type, unsigned int flags) {
+    if (!g_origRenderCB) return;
+
+    // Pass 1: through wall
+    g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)0);
+    g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)0);
+    g_RwRSSet(rwRENDERSTATETEXTURERASTER, (void*)0);
+    g_origRenderCB(repEntry, object, type, flags);
+
+    // Pass 2: normal
+    g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)1);
+    g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)1);
+    g_origRenderCB(repEntry, object, type, flags);
+
+    // Restore
+    g_RwRSSet(rwRENDERSTATEZTESTENABLE,   (void*)1);
+    g_RwRSSet(rwRENDERSTATEZWRITEENABLE,  (void*)1);
+    g_RwRSSet(rwRENDERSTATETEXTURERASTER, (void*)0);
+}
+
+// ─── Install ──────────────────────────────────────────────────────────────────
+static void InstallChams() {
+    uintptr_t base = GetBase();
+    if (!base) { LOGF("[chams] ERROR: no base"); return; }
+
+    auto fnSkinGetPipe = (RpSkinGetOpenGLPipeline_t)          OFF(OFF_RpSkinGetOpenGLPipeline);
+    auto fnFindNode    = (RxPipelineFindNodeByName_t)          OFF(OFF_RxPipelineFindNodeByName);
+    auto fnSetCB       = (RxOpenGLAllInOneSetRenderCallBack_t) OFF(OFF_RxOpenGLAllInOneSetRenderCallBack);
+    auto fnGetCB       = (RxOpenGLAllInOneGetRenderCallBack_t) OFF(OFF_RxOpenGLAllInOneGetRenderCallBack);
+    g_RwRSSet          = (RwRenderStateSet_t)                  OFF(OFF_RwRenderStateSet);
+
+    LOGF("[chams] Trying rpSKINTYPEMATFX...");
+    RxPipeline* pipe = fnSkinGetPipe(rpSKINTYPEMATFX);
+    LOGF("[chams] pipe(MATFX): %p", pipe);
+
+    if (!pipe) {
+        LOGF("[chams] Trying rpSKINTYPEGENERIC...");
+        pipe = fnSkinGetPipe(rpSKINTYPEGENERIC);
+        LOGF("[chams] pipe(GENERIC): %p", pipe);
+    }
+    if (!pipe) { LOGF("[chams] ERROR: no pipeline"); return; }
+
+    int idx = 0;
+    RxPipelineNode* node = fnFindNode(pipe, "OpenGLAtomicAllInOne", nullptr, &idx);
+    LOGF("[chams] node: %p idx: %d", node, idx);
+    if (!node) { LOGF("[chams] ERROR: node not found"); return; }
+
+    g_origRenderCB = fnGetCB(node);
+    LOGF("[chams] origCB: %p", g_origRenderCB);
+    if (!g_origRenderCB) { LOGF("[chams] ERROR: no origCB"); return; }
+
+    fnSetCB(node, ChamsRenderCB);
+    g_chamsInstalled = true;
+    LOGF("[chams] SUCCESS - chams installed!");
+}
+
+// ─── AML exports ──────────────────────────────────────────────────────────────
 extern "C" {
 
 EXPORT void* __GetModInfo() {
@@ -17,11 +127,14 @@ EXPORT void* __GetModInfo() {
 }
 
 EXPORT void OnModPreLoad() {
-    LOGI("OnModPreLoad");
+    remove(LOGFILE);
+    LOGF("[chams] OnModPreLoad");
 }
 
 EXPORT void OnModLoad() {
-    LOGI("OnModLoad - alive!");
+    LOGF("[chams] OnModLoad start");
+    InstallChams();
+    LOGF("[chams] OnModLoad done, installed=%d", g_chamsInstalled);
 }
 
 }
