@@ -5,28 +5,23 @@
 #include <android/log.h>
 
 #define TAG "libchams"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-struct ModInfo {
-    const char* name;
-    const char* version;
-    int         handlerVer;
-};
+#define EXPORT __attribute__((visibility("default")))
 
-extern "C" __attribute__((visibility("default")))
-void __GetModInfo(ModInfo* info) {
-    info->name       = "libchams";
-    info->version    = "2.2-test";
-    info->handlerVer = 1;
+extern "C" {
+
+EXPORT void* __GetModInfo() {
+    static const char* info = "libchams|2.0|Chams RxOpenGL|brruham";
+    return (void*)info;
 }
 
-extern "C" __attribute__((visibility("default")))
-void OnModPreLoad() {
-    LOGI("OnModPreLoad called");
+EXPORT void OnModPreLoad() {
+    LOGI("OnModPreLoad");
 }
 
-extern "C" __attribute__((visibility("default")))
-void OnModLoad() {
-    LOGI("OnModLoad called - mod is alive!");
+EXPORT void OnModLoad() {
+    LOGI("OnModLoad - alive!");
+}
+
 }
